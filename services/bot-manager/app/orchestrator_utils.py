@@ -304,7 +304,7 @@ async def start_bot_container(
         "Labels": {"vexa.user_id": str(user_id)}, # *** ADDED Label ***
         "HostConfig": {
             "NetworkMode": DOCKER_NETWORK,
-            "AutoRemove": True,
+            "AutoRemove": False,  # [LOCAL-FORK] Changed from True to False for debugging crashed bot containers
         },
     }
 

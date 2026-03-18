@@ -1,0 +1,454 @@
+# =============================================================================
+# Vexa - Full Local Setup (GPU Transcription, Local DB, All Services)
+# =============================================================================
+# Usage:
+#   docker compose -f docker-compose.local-full.yml up -d --build
+#
+# This single file runs the ENTIRE Vexa stack locally:
+#   - PostgreSQL database
+#   - Redis
+#   - MinIO (S3-compatible object storage)
+#   - API Gateway (port 8056)
+#   - Admin API (port 8057)
+#   - Bot Manager
+#   - WhisperLive (real-time audio relay)
+#   - Transcription Service with GPU (faster-whisper, large-v3-turbo)
+#   - Transcription Collector
+#   - TTS Service
+#   - MCP Service
+#   - Dashboard UI (port 3001)
+# =============================================================================
+
+name: vexa_local
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: vexa
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vexa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.0-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: vexa-access-key
+      MINIO_ROOT_PASSWORD: vexa-secret-key
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sleep 5
+        mc alias set vexa http://minio:9000 vexa-access-key vexa-secret-key
+        mc mb --ignore-existing vexa/vexa-recordings
+        cat > /tmp/cors.xml <<'XML'
+        <CORSConfiguration>
+          <CORSRule>
+            <AllowedOrigin>*</AllowedOrigin>
+            <AllowedMethod>GET</AllowedMethod>
+            <AllowedMethod>HEAD</AllowedMethod>
+            <AllowedHeader>*</AllowedHeader>
+          </CORSRule>
+        </CORSConfiguration>
+        XML
+        mc cors set vexa/vexa-recordings /tmp/cors.xml || echo "cors set unsupported; continuing"
+        mc anonymous set download vexa/vexa-recordings || true
+        exit 0
+    networks:
+      - vexa_default
+
+  # ---------------------------------------------------------------------------
+  # Transcription Service (GPU) — faster-whisper with large-v3-turbo
+  # ---------------------------------------------------------------------------
+  transcription-nginx:
+    image: nginx:alpine
+    volumes:
+      - ./services/transcription-service/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      transcription-worker-1:
+        condition: service_started
+    networks:
+      vexa_default:
+        aliases:
+          - transcription-service
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/lb-status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  transcription-worker-1:
+    build:
+      context: ./services/transcription-service
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "1"
+      MODEL_SIZE: large-v3-turbo
+      DEVICE: cuda
+      COMPUTE_TYPE: float16
+      CPU_THREADS: "0"
+      API_TOKEN: "local-transcription-key"
+    volumes:
+      - transcription-models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - vexa_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # Core Vexa Services
+  # ---------------------------------------------------------------------------
+  admin-api:
+    build:
+      context: .
+      dockerfile: services/admin-api/Dockerfile
+    ports:
+      - "8057:8001"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: vexa
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSL_MODE: disable
+      ADMIN_API_TOKEN: vexa-local-admin-token
+      LOG_LEVEL: DEBUG
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  transcription-collector:
+    build:
+      context: .
+      dockerfile: services/transcription-collector/Dockerfile
+    volumes:
+      - ./alembic.ini:/app/alembic.ini
+      - ./libs/shared-models/alembic:/app/alembic
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: vexa
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSL_MODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_STREAM_NAME: transcription_segments
+      REDIS_CONSUMER_GROUP: collector_group
+      REDIS_STREAM_READ_COUNT: "10"
+      REDIS_STREAM_BLOCK_MS: "2000"
+      ADMIN_TOKEN: vexa-local-admin-token
+      BACKGROUND_TASK_INTERVAL: "10"
+      IMMUTABILITY_THRESHOLD: "30"
+      REDIS_SEGMENT_TTL: "3600"
+      REDIS_CLEANUP_THRESHOLD: "86400"
+      LOG_LEVEL: DEBUG
+      STORAGE_BACKEND: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: vexa-access-key
+      MINIO_SECRET_KEY: vexa-secret-key
+      MINIO_BUCKET: vexa-recordings
+      MINIO_SECURE: "false"
+    init: true
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    ports:
+      - "8056:8000"
+    environment:
+      ADMIN_API_URL: http://admin-api:8001
+      BOT_MANAGER_URL: http://bot-manager:8080
+      TRANSCRIPTION_COLLECTOR_URL: http://transcription-collector:8000
+      MCP_URL: http://mcp:18888
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_BASE_URL: http://localhost:8056
+      TRANSCRIPT_SHARE_TTL_SECONDS: "900"
+      LOG_LEVEL: DEBUG
+    init: true
+    depends_on:
+      admin-api:
+        condition: service_started
+      bot-manager:
+        condition: service_started
+      transcription-collector:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  bot-manager:
+    build:
+      context: .
+      dockerfile: services/bot-manager/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BOT_IMAGE_NAME: vexa-bot:dev
+      TTS_SERVICE_URL: http://tts-service:8002
+      DOCKER_NETWORK: vexa_local_vexa_default
+      LOG_LEVEL: DEBUG
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: vexa
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSL_MODE: disable
+      DOCKER_HOST: unix://var/run/docker.sock
+      DEVICE_TYPE: remote
+      WHISPER_LIVE_URL: ws://whisperlive:9090/ws
+      ADMIN_TOKEN: vexa-local-admin-token
+      # Storage
+      STORAGE_BACKEND: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: vexa-access-key
+      MINIO_SECRET_KEY: vexa-secret-key
+      MINIO_BUCKET: vexa-recordings
+      MINIO_SECURE: "false"
+      LOCAL_STORAGE_DIR: /data/recordings
+      LOCAL_STORAGE_FSYNC: "true"
+      RECORDING_ENABLED: "false"
+      CAPTURE_MODES: audio
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - recordings-data:/data/recordings
+    init: true
+    depends_on:
+      redis:
+        condition: service_started
+      tts-service:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  whisperlive:
+    build:
+      context: .
+      dockerfile: services/WhisperLive/Dockerfile.cpu
+    volumes:
+      - wl-recordings:/var/lib/wl-recordings
+    environment:
+      REDIS_STREAM_URL: redis://redis:6379/0/transcription_segments
+      TRANSCRIPTION_COLLECTOR_URL: redis://redis:6379/0/transcription_segments
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_STREAM_NAME: transcription_segments
+      LANGUAGE_DETECTION_SEGMENTS: "10"
+      VAD_FILTER_THRESHOLD: "0.5"
+      MIN_AUDIO_S: "2.0"
+      MIN_AUDIO_S_TIER2: "20.0"
+      MIN_TIME_BETWEEN_REQUESTS_S: "0.5"
+      MIN_TIME_BETWEEN_REQUESTS_S_TIER2: "20.0"
+      WL_RECORDING_DIR: /var/lib/wl-recordings
+      WL_RECORDING_FLUSH_SECONDS: "3"
+      WL_RECORDING_FSYNC_SECONDS: "10"
+      WL_RECORDING_ROTATE_SECONDS: "20"
+      WL_RECORDING_ROTATE_BYTES: "16777216"
+      WL_RECORDING_SNAPSHOT_SECONDS: "20"
+      WL_RECORDING_UPLOAD_URL: http://bot-manager:8080/internal/recordings/upload
+      SAME_OUTPUT_THRESHOLD: "3"
+      SAME_OUTPUT_THRESHOLD_TIER2: "2"
+      DEVICE_TYPE: remote
+      REMOTE_TRANSCRIBER_URL: http://transcription-service:80/v1/audio/transcriptions
+      REMOTE_TRANSCRIBER_API_KEY: "local-transcription-key"
+      CONSUL_ENABLE: "false"
+      WL_REDIS_DISCOVERY_ENABLED: "false"
+    command: >-
+      --port 9090
+      --backend remote
+      --min_audio_s 2.0
+      --min_audio_s_tier2 20.0
+      --min_time_between_requests_s 0.5
+      --min_time_between_requests_s_tier2 20.0
+      --wl_recording_dir /var/lib/wl-recordings
+      --wl_recording_flush_seconds 3
+      --wl_recording_fsync_seconds 10
+      --wl_recording_rotate_seconds 20
+      --wl_recording_rotate_bytes 16777216
+      --wl_recording_snapshot_seconds 20
+      --same_output_threshold 3
+      --same_output_threshold_tier2 2
+    expose:
+      - "9090"
+      - "9091"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    depends_on:
+      transcription-collector:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  tts-service:
+    build:
+      context: .
+      dockerfile: services/tts-service/Dockerfile
+    expose:
+      - "8002"
+    environment:
+      OPENAI_API_KEY: ""
+      OPENAI_BASE_URL: https://api.openai.com
+      TTS_API_TOKEN: ""
+      LOG_LEVEL: DEBUG
+    init: true
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: .
+      dockerfile: services/mcp/Dockerfile
+    ports:
+      - "18888:18888"
+    environment:
+      API_GATEWAY_URL: http://api-gateway:8000
+      LOG_LEVEL: DEBUG
+    init: true
+    depends_on:
+      api-gateway:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Dashboard UI
+  # ---------------------------------------------------------------------------
+  # [LOCAL-FORK] The dashboard hardcodes Secure flag on cookies, which breaks
+  # plain HTTP access from other machines. We put nginx in front to strip it.
+  dashboard-internal:
+    image: vexaai/vexa-dashboard:latest
+    expose:
+      - "3000"
+    environment:
+      VEXA_API_URL: http://api-gateway:8000
+      VEXA_ADMIN_API_KEY: vexa-local-admin-token
+      VEXA_ADMIN_API_URL: http://admin-api:8001
+      JWT_SECRET: vexa-local-jwt-secret
+      NEXT_PUBLIC_APP_URL: ${PUBLIC_HOST_URL:-http://localhost:3001}
+      NEXT_PUBLIC_VEXA_WS_URL: ${PUBLIC_WS_URL:-ws://localhost:8056/ws}
+      NEXT_PUBLIC_BASE_URL: ${PUBLIC_API_URL:-http://localhost:8056}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3001}
+      NODE_ENV: development
+      AI_BASE_URL: http://ollama-proxy:8765/v1
+      AI_MODEL: ollama/qwen3.5:27b
+      AI_API_KEY: ollama
+    depends_on:
+      api-gateway:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./dashboard-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      dashboard-internal:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Ollama Proxy (fixes Vercel AI SDK system prompt compatibility)
+  # ---------------------------------------------------------------------------
+  ollama-proxy:
+    image: python:3.12-alpine
+    volumes:
+      - ./ollama-proxy.py:/app/ollama-proxy.py:ro
+    command: python /app/ollama-proxy.py
+    environment:
+      OLLAMA_URL: http://host.docker.internal:11434
+      PORT: "8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8765"
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  recordings-data:
+  wl-recordings:
+  transcription-models:
+
+networks:
+  vexa_default:
+    name: vexa_local_vexa_default
+    driver: bridge

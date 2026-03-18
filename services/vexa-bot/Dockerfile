@@ -118,9 +118,9 @@ RUN mkdir -p /root/ms-playwright && chmod -R 777 /root/ms-playwright
 RUN mkdir -p /app/vexa-bot/storage/screenshots /app/vexa-bot/storage/logs /app/vexa-bot/storage/temp && \
     chmod -R 777 /app/vexa-bot/storage
 
-# Copy entrypoint script
+# [LOCAL-FORK] Copy entrypoint script and fix Windows line endings (CRLF -> LF)
 COPY core/entrypoint.sh /app/vexa-bot/entrypoint.sh
-RUN chmod +x /app/vexa-bot/entrypoint.sh
+RUN sed -i 's/\r$//' /app/vexa-bot/entrypoint.sh && chmod +x /app/vexa-bot/entrypoint.sh
 
 # Set environment
 ENV DISPLAY=:99

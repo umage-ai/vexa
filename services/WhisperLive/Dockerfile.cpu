@@ -37,13 +37,13 @@ RUN pip install --no-cache-dir 'faster-whisper[cpu]'
 # Now copy the application code
 COPY services/WhisperLive/ /app/
 
-# Copy our entrypoint script
+# [LOCAL-FORK] Copy our entrypoint script and fix Windows line endings (CRLF -> LF)
 COPY services/WhisperLive/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
-# Copy healthcheck script
+# [LOCAL-FORK] Copy healthcheck script and fix Windows line endings (CRLF -> LF)
 COPY services/WhisperLive/healthcheck.sh /healthcheck.sh
-RUN chmod +x /healthcheck.sh
+RUN sed -i 's/\r$//' /healthcheck.sh && chmod +x /healthcheck.sh
 
 # Set it as the entrypoint
 ENTRYPOINT ["/entrypoint.sh"]
