@@ -7,6 +7,7 @@ import { BotConfig } from '../types';
 import { log } from '../utils';
 import http from 'http';
 import https from 'https';
+import crypto from 'crypto'; // [LOCAL-FORK] for change detection hashing
 import { createClient, RedisClientType } from 'redis';
 
 export class VisionSnapshotService {
@@ -18,6 +19,13 @@ export class VisionSnapshotService {
   private sessionStartPublished: boolean = false;
   private visionSessionUid: string;
   private stopped: boolean = false;
+
+  // [LOCAL-FORK] Change detection state
+  private previousHash: string | null = null;
+  private previousBuffer: Buffer | null = null;
+  private static readonly CHANGE_THRESHOLD = 0.15; // 15% of sampled bytes must differ
+  private static readonly SAMPLE_STEP = 1000; // sample every 1000th byte
+  private static readonly BYTE_DIFF_THRESHOLD = 10; // byte values must differ by more than this
 
   constructor(page: Page, botConfig: BotConfig) {
     this.page = page;
@@ -83,17 +91,72 @@ export class VisionSnapshotService {
       return;
     }
 
-    // Upload screenshot to bot-manager (fire-and-forget)
-    this._uploadScreenshot(screenshotBuffer).catch((err) => {
-      log(`[Vision] Upload error (non-fatal): ${err.message}`);
-    });
+    // [LOCAL-FORK] Change detection — skip if image hasn't changed substantially
+    if (!this._hasSubstantialChange(screenshotBuffer)) {
+      log('[Vision] No substantial change detected, skipping tick');
+      return;
+    }
 
-    // Describe via Ollama vision model (fire-and-forget with publish on success)
+    // [LOCAL-FORK] Update stored previous screenshot for next comparison
+    this.previousHash = crypto.createHash('md5').update(screenshotBuffer).digest('hex');
+    this.previousBuffer = screenshotBuffer;
+
+    // [LOCAL-FORK] Content filtering — ask LLM if this is shared content vs webcam feeds.
+    // If the vision model is configured, we use the combined prompt that both classifies
+    // and describes. Upload and publish only happen if the LLM says it's shared content.
     if (this.botConfig.visionModelUrl && this.botConfig.visionModelName) {
-      this._describeImage(screenshotBuffer).catch((err) => {
-        log(`[Vision] Describe error (non-fatal): ${err.message}`);
+      this._classifyAndDescribeImage(screenshotBuffer).catch((err) => {
+        log(`[Vision] Classify+describe error (non-fatal): ${err.message}`);
+      });
+    } else {
+      // No vision model configured — fall back to upload-only (original behavior)
+      this._uploadScreenshot(screenshotBuffer).catch((err) => {
+        log(`[Vision] Upload error (non-fatal): ${err.message}`);
       });
     }
+  }
+
+  // [LOCAL-FORK] Determine if the screenshot has changed substantially from the previous one.
+  // Uses MD5 for exact-match check, then byte-sampling for fuzzy comparison.
+  private _hasSubstantialChange(currentBuffer: Buffer): boolean {
+    if (!this.previousBuffer || !this.previousHash) {
+      // First screenshot — always process
+      return true;
+    }
+
+    // Exact match via MD5
+    const currentHash = crypto.createHash('md5').update(currentBuffer).digest('hex');
+    if (currentHash === this.previousHash) {
+      return false;
+    }
+
+    // Fuzzy comparison: sample every Nth byte and count substantial differences
+    const prev = this.previousBuffer;
+    const curr = currentBuffer;
+    const minLen = Math.min(prev.length, curr.length);
+    const step = VisionSnapshotService.SAMPLE_STEP;
+    const diffThreshold = VisionSnapshotService.BYTE_DIFF_THRESHOLD;
+
+    let sampledCount = 0;
+    let diffCount = 0;
+
+    for (let i = 0; i < minLen; i += step) {
+      sampledCount++;
+      if (Math.abs(prev[i] - curr[i]) > diffThreshold) {
+        diffCount++;
+      }
+    }
+
+    // Also account for significant size difference as a change signal
+    const sizeDiffRatio = Math.abs(prev.length - curr.length) / Math.max(prev.length, curr.length);
+    if (sizeDiffRatio > 0.1) {
+      log(`[Vision] Size difference ${(sizeDiffRatio * 100).toFixed(1)}% — treating as substantial change`);
+      return true;
+    }
+
+    const changeRatio = sampledCount > 0 ? diffCount / sampledCount : 0;
+    log(`[Vision] Change detection: ${(changeRatio * 100).toFixed(1)}% of sampled bytes differ (threshold: ${VisionSnapshotService.CHANGE_THRESHOLD * 100}%)`);
+    return changeRatio >= VisionSnapshotService.CHANGE_THRESHOLD;
   }
 
   // ==================== Screenshot upload ====================
@@ -176,22 +239,35 @@ export class VisionSnapshotService {
 
   // ==================== Ollama vision description ====================
 
-  private async _describeImage(imageBuffer: Buffer): Promise<void> {
+  // [LOCAL-FORK] Combined classify + describe: asks the LLM whether this is shared content
+  // (screen share, presentation, document, app) vs participant video feeds, and if so,
+  // what is being shown. Only uploads and publishes when content is meaningful.
+  private async _classifyAndDescribeImage(imageBuffer: Buffer): Promise<void> {
     const modelUrl = this.botConfig.visionModelUrl!;
     const modelName = this.botConfig.visionModelName!;
     const base64Image = imageBuffer.toString('base64');
+
+    // [LOCAL-FORK] Combined prompt: classify AND describe in one call
+    const prompt = [
+      'Analyze this screenshot from a video meeting. Answer TWO questions:',
+      '1. Is this a screen share, presentation, document, or application being shared? Or is it just showing participant video feeds / webcam gallery view?',
+      '2. If it IS shared content (not just webcam feeds), describe what is being shown. Be concise, focus on the main content visible.',
+      '',
+      'Reply ONLY with JSON (no markdown fences): {"is_shared_content": true/false, "description": "..."}',
+      'If is_shared_content is false, set description to an empty string.',
+    ].join('\n');
 
     const requestBody = JSON.stringify({
       model: modelName,
       messages: [{
         role: 'user',
-        content: 'Describe what is being shown on this screen share during a meeting. Be concise, focus on the main content visible.',
+        content: prompt,
         images: [base64Image],
       }],
       stream: false,
     });
 
-    const description = await new Promise<string>((resolve, reject) => {
+    const rawResponse = await new Promise<string>((resolve, reject) => {
       const url = new URL(`${modelUrl}/api/chat`);
       const transport = url.protocol === 'https:' ? https : http;
       const req = transport.request(
@@ -228,10 +304,39 @@ export class VisionSnapshotService {
       req.end();
     });
 
-    if (description && !this.stopped) {
-      log(`[Vision] Description: "${description.substring(0, 120)}..."`);
-      await this._publishVisionSegment(description);
+    if (!rawResponse || this.stopped) return;
+
+    // [LOCAL-FORK] Parse the JSON classification response
+    let classification: { is_shared_content: boolean; description: string };
+    try {
+      // Strip markdown fences if the model wrapped it anyway
+      const cleaned = rawResponse.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+      classification = JSON.parse(cleaned);
+    } catch {
+      // If we can't parse JSON, fall back: treat as shared content with the raw text as description
+      log(`[Vision] Could not parse classification JSON, falling back to raw description`);
+      classification = { is_shared_content: true, description: rawResponse };
     }
+
+    if (!classification.is_shared_content) {
+      log('[Vision] LLM says this is participant video feeds, skipping upload+publish');
+      return;
+    }
+
+    const description = classification.description || '';
+    if (!description) {
+      log('[Vision] LLM classified as shared content but description is empty, skipping');
+      return;
+    }
+
+    log(`[Vision] Shared content detected: "${description.substring(0, 120)}..."`);
+
+    // [LOCAL-FORK] Only upload and publish for meaningful shared content
+    this._uploadScreenshot(imageBuffer).catch((err) => {
+      log(`[Vision] Upload error (non-fatal): ${err.message}`);
+    });
+
+    await this._publishVisionSegment(description);
   }
 
   // ==================== Redis transcript publishing ====================
