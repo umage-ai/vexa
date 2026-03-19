@@ -2384,6 +2384,195 @@ async def update_recording_config(
     }
 
 
+# --- [LOCAL-FORK] MEETING SUMMARY ENDPOINTS ---
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", os.environ.get("LLM_MODEL", "qwen3.5:35b"))
+DEFAULT_SUMMARY_PROMPT = os.environ.get(
+    "SUMMARY_PROMPT",
+    "Please analyze this meeting transcript. Provide a well-structured meeting summary in markdown format including: "
+    "## Summary, ## Key Decisions, ## Action Items (with assignees if mentioned), ## Discussion Points, ## Next Steps. "
+    "Be concise but thorough.",
+)
+
+
+class SummaryConfigUpdate(BaseModel):  # [LOCAL-FORK]
+    prompt: str = Field(..., description="Custom summary prompt text")
+
+
+@app.post("/meetings/{platform}/{native_meeting_id}/summary",
+          summary="Generate an AI summary for a meeting",
+          tags=["Meetings"])
+async def generate_meeting_summary(
+    platform: str,
+    native_meeting_id: str,
+    auth: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """[LOCAL-FORK] Fetch the meeting transcript, send it to the local Ollama LLM,
+    store the markdown summary in meeting.data['summary'], and return it."""
+    token, user = auth
+
+    # --- Look up the meeting ---
+    stmt = select(Meeting).where(
+        and_(
+            Meeting.user_id == user.id,
+            Meeting.platform == platform,
+            Meeting.platform_specific_id == native_meeting_id,
+        )
+    ).order_by(desc(Meeting.id))
+    result = await db.execute(stmt)
+    meeting = result.scalars().first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # --- Fetch transcript from transcription-collector ---
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"http://transcription-collector:8000/transcripts/{platform}/{native_meeting_id}",
+                headers={"X-API-Key": token},  # [LOCAL-FORK] transcription-collector uses X-API-Key
+            )
+            resp.raise_for_status()
+            transcript_data = resp.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[Summary] Failed to fetch transcript: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch transcript: {e.response.status_code}")
+    except Exception as e:
+        logger.error(f"[Summary] Error fetching transcript: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch transcript from transcription-collector")
+
+    # Build plain-text transcript from segments
+    segments = transcript_data if isinstance(transcript_data, list) else transcript_data.get("segments", transcript_data.get("transcripts", []))
+    if not segments:
+        raise HTTPException(status_code=404, detail="No transcript segments found for this meeting")
+
+    transcript_lines = []
+    for seg in segments:
+        speaker = seg.get("speaker") or seg.get("speaker_name") or "Unknown"
+        text = seg.get("text") or seg.get("content") or ""
+        if text.strip():
+            transcript_lines.append(f"{speaker}: {text.strip()}")
+    transcript_text = "\n".join(transcript_lines)
+
+    if not transcript_text.strip():
+        raise HTTPException(status_code=404, detail="Transcript is empty")
+
+    # --- Determine the prompt ---
+    user_prompt = None
+    if user.data and isinstance(user.data, dict):
+        user_prompt = user.data.get("summary_prompt")
+    prompt = user_prompt or DEFAULT_SUMMARY_PROMPT
+
+    # --- Call Ollama ---
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            ollama_resp = await client.post(f"{OLLAMA_URL}/api/chat", json={
+                "model": SUMMARY_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a professional meeting analyst. Always respond in well-formatted markdown."},
+                    {"role": "user", "content": f"{prompt}\n\nTRANSCRIPT:\n{transcript_text}"},
+                ],
+                "stream": False,
+            })
+            ollama_resp.raise_for_status()
+            ollama_data = ollama_resp.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[Summary] Ollama HTTP error: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail=f"Ollama request failed: {e.response.status_code}")
+    except Exception as e:
+        logger.error(f"[Summary] Ollama request error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to communicate with Ollama")
+
+    summary_text = ollama_data.get("message", {}).get("content", "")
+    if not summary_text:
+        raise HTTPException(status_code=502, detail="Ollama returned an empty response")
+
+    generated_at = datetime.utcnow().isoformat()
+
+    # --- Store summary in meeting.data ---
+    new_data = dict(meeting.data) if meeting.data else {}
+    new_data["summary"] = {"content": summary_text, "generated_at": generated_at, "model": SUMMARY_MODEL}
+    meeting.data = new_data
+    attributes.flag_modified(meeting, "data")
+    await db.commit()
+    await db.refresh(meeting)
+
+    logger.info(f"[Summary] Generated summary for meeting {meeting.id} ({platform}/{native_meeting_id})")
+    return {"summary": summary_text, "generated_at": generated_at}
+
+
+@app.get("/meetings/{platform}/{native_meeting_id}/summary",
+         summary="Get stored meeting summary",
+         tags=["Meetings"])
+async def get_meeting_summary(
+    platform: str,
+    native_meeting_id: str,
+    auth: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """[LOCAL-FORK] Return the stored meeting summary if one exists, or 404."""
+    token, user = auth
+
+    stmt = select(Meeting).where(
+        and_(
+            Meeting.user_id == user.id,
+            Meeting.platform == platform,
+            Meeting.platform_specific_id == native_meeting_id,
+        )
+    ).order_by(desc(Meeting.id))
+    result = await db.execute(stmt)
+    meeting = result.scalars().first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    summary_data = (meeting.data or {}).get("summary")
+    if not summary_data:
+        raise HTTPException(status_code=404, detail="No summary available for this meeting")
+
+    # Support both old format (plain string) and new format (dict with metadata)
+    if isinstance(summary_data, str):
+        return {"summary": summary_data, "generated_at": None}
+    return {"summary": summary_data.get("content", ""), "generated_at": summary_data.get("generated_at")}
+
+
+@app.put("/user/summary-config",
+         summary="Set custom summary prompt",
+         tags=["User"])
+async def update_summary_config(
+    config: SummaryConfigUpdate,
+    auth: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """[LOCAL-FORK] Store a custom summary prompt in user.data['summary_prompt']."""
+    token, user = auth
+
+    new_data = dict(user.data) if user.data else {}
+    new_data["summary_prompt"] = config.prompt
+    user.data = new_data
+    attributes.flag_modified(user, "data")
+    await db.commit()
+    await db.refresh(user)
+
+    return {"prompt": config.prompt}
+
+
+@app.get("/user/summary-config",
+         summary="Get current summary prompt configuration",
+         tags=["User"])
+async def get_summary_config(
+    auth: tuple = Depends(get_user_and_token),
+):
+    """[LOCAL-FORK] Return the user's custom summary prompt, or the default."""
+    token, user = auth
+    user_prompt = None
+    if user.data and isinstance(user.data, dict):
+        user_prompt = user.data.get("summary_prompt")
+    return {"prompt": user_prompt or DEFAULT_SUMMARY_PROMPT}
+
+# --- [LOCAL-FORK] END MEETING SUMMARY ENDPOINTS ---
+
+
 # --- [LOCAL-FORK] AVATAR ENDPOINTS ---
 
 MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2MB

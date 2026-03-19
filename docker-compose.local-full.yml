@@ -259,9 +259,10 @@ services:
       DEVICE_TYPE: remote
       WHISPER_LIVE_URL: ws://whisperlive:9090/ws
       ADMIN_TOKEN: vexa-local-admin-token
-      # [LOCAL-FORK] Vision snapshot configuration
+      # [LOCAL-FORK] Vision snapshot + summary configuration
       OLLAMA_URL: http://host.docker.internal:11434
       VISION_MODEL: ${VISION_MODEL:-qwen3-vl:8b}
+      SUMMARY_MODEL: ${SUMMARY_MODEL:-qwen3.5:35b}
       # Storage
       STORAGE_BACKEND: minio
       MINIO_ENDPOINT: minio:9000
@@ -410,7 +411,7 @@ services:
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3001}
       NODE_ENV: development
       AI_BASE_URL: http://ollama-proxy:8765/v1
-      AI_MODEL: ollama/qwen3.5:27b
+      AI_MODEL: ollama/qwen3.5:35b
       AI_API_KEY: ollama
       # [LOCAL-FORK] Decision listener URL (NEXT_PUBLIC_ = client-side, needs host-reachable URL)
       NEXT_PUBLIC_DECISION_LISTENER_URL: ${DECISION_LISTENER_URL:-http://localhost:8766}
@@ -447,10 +448,12 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       OLLAMA_URL: http://host.docker.internal:11434
-      LLM_MODEL: ${LLM_MODEL:-qwen3.5:27b}
+      LLM_MODEL: ${LLM_MODEL:-gpt-oss:20b}
       WINDOW_SIZE: "20"
       ANALYSIS_INTERVAL: "15"
       PORT: "8766"
+      API_GATEWAY_URL: http://api-gateway:8000
+      VEXA_API_KEY: ${VEXA_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

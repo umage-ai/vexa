@@ -35,6 +35,10 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5:27b")
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "20"))  # transcript segments per analysis window
 ANALYSIS_INTERVAL = float(os.environ.get("ANALYSIS_INTERVAL", "15"))  # seconds between analyses
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+# [LOCAL-FORK] API gateway URL — single entry point that proxies to bot-manager & transcription-collector
+API_GATEWAY_URL = os.environ.get("API_GATEWAY_URL", "http://api-gateway:8000")
+# Vexa API key for authenticated requests through the gateway
+VEXA_API_KEY = os.environ.get("VEXA_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Models
@@ -211,19 +215,79 @@ async def analyze_transcript_window(segments: list[dict], meeting_id: str) -> Op
 # Meeting analysis loop
 # ---------------------------------------------------------------------------
 
+# Cache: meeting_id -> (platform, native_id)
+_meeting_lookup_cache: dict[str, tuple[str, str]] = {}
+
+async def fetch_segments_from_api(meeting_id: str) -> list[dict]:
+    """[LOCAL-FORK] Fetch transcript segments via the API gateway.
+    Used when Redis segments have been flushed to Postgres (completed meetings).
+
+    Strategy: Call the API gateway (which proxies to bot-manager and
+    transcription-collector) using VEXA_API_KEY for auth.
+    """
+    auth_headers = {"X-API-Key": VEXA_API_KEY} if VEXA_API_KEY else {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Step 1: Get platform and native_id for this meeting_id
+            platform, native_id = _meeting_lookup_cache.get(meeting_id, (None, None))
+
+            if not platform or not native_id:
+                resp = await client.get(
+                    f"{API_GATEWAY_URL}/meetings",
+                    headers=auth_headers,
+                )
+                if resp.status_code == 200:
+                    meetings = resp.json()
+                    meeting_list = meetings if isinstance(meetings, list) else meetings.get("meetings", [])
+                    for m in meeting_list:
+                        mid = str(m.get("id", ""))
+                        if mid == meeting_id:
+                            platform = m.get("platform", "")
+                            native_id = m.get("platform_specific_id", "") or m.get("native_meeting_id", "")
+                            if platform and native_id:
+                                _meeting_lookup_cache[meeting_id] = (platform, native_id)
+                            break
+                else:
+                    print(f"[decision-listener] Meetings lookup failed: {resp.status_code} {resp.text[:200]}")
+
+            if not platform or not native_id:
+                print(f"[decision-listener] Could not resolve meeting {meeting_id} to platform/native_id")
+                return []
+
+            # Step 2: Fetch transcript segments via the gateway
+            resp = await client.get(
+                f"{API_GATEWAY_URL}/transcripts/{platform}/{native_id}",
+                headers=auth_headers,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                segments = data.get("segments", [])
+                print(f"[decision-listener] Fetched {len(segments)} segments for meeting {meeting_id} ({platform}/{native_id})")
+                return segments
+            else:
+                print(f"[decision-listener] Transcript fetch failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[decision-listener] API segment fetch error: {e}")
+    return []
+
+
 async def meeting_analysis_loop(meeting_id: str):
     """Continuously analyze transcript segments for a meeting."""
     print(f"[decision-listener] Starting analysis loop for meeting {meeting_id}")
     segment_buffer: list[dict] = []
     last_analysis_time = 0.0
+    api_fetched = False  # Only fetch from API once for completed meetings
+    analysis_count = 0
 
     while True:
         try:
-            # Fetch segments from Redis
+            # Try Redis first (live meetings)
+            redis_segments_found = False
             if redis_client:
                 redis_key = f"meeting:{meeting_id}:segments"
                 raw_segments = await redis_client.hgetall(redis_key)
                 if raw_segments:
+                    redis_segments_found = True
                     all_segments = []
                     for start_key, val_json in raw_segments.items():
                         try:
@@ -236,24 +300,60 @@ async def meeting_analysis_loop(meeting_id: str):
                     all_segments.sort(key=lambda s: s.get("start_time", 0))
                     segment_buffer = all_segments[-WINDOW_SIZE:]
 
+            # [LOCAL-FORK] If Redis is empty and we haven't fetched from API yet, try the API.
+            # Always set api_fetched=True afterwards to avoid spamming repeated lookups.
+            if not redis_segments_found and not api_fetched:
+                print(f"[decision-listener] No Redis segments for meeting {meeting_id}, fetching from API...")
+                api_segments = await fetch_segments_from_api(meeting_id)
+                api_fetched = True  # prevent repeated fetch attempts regardless of result
+                if api_segments:
+                    print(f"[decision-listener] Got {len(api_segments)} segments from API for meeting {meeting_id}")
+                    segment_buffer = api_segments[-WINDOW_SIZE:]
+                else:
+                    print(f"[decision-listener] No segments found for meeting {meeting_id} (Redis or API)")
+
             now = time.time()
             if now - last_analysis_time >= ANALYSIS_INTERVAL and len(segment_buffer) > 0:
                 last_analysis_time = now
-                event = await analyze_transcript_window(segment_buffer, meeting_id)
-                if event:
-                    # Store
-                    if meeting_id not in decisions:
-                        decisions[meeting_id] = []
-                    decisions[meeting_id].append(event)
-                    print(f"[decision-listener] [{meeting_id}] {event.type}: {event.summary}")
 
-                    # Notify SSE subscribers
-                    event_data = event.model_dump()
-                    for queue in subscribers.get(meeting_id, []):
-                        try:
-                            queue.put_nowait(event_data)
-                        except asyncio.QueueFull:
-                            pass
+                # For completed meetings (API-sourced), analyze in sliding windows
+                if api_fetched and analysis_count == 0:
+                    # Analyze the full transcript in chunks for completed meetings
+                    all_api_segments = await fetch_segments_from_api(meeting_id)
+                    chunk_size = WINDOW_SIZE
+                    for i in range(0, len(all_api_segments), chunk_size):
+                        chunk = all_api_segments[i:i + chunk_size]
+                        event = await analyze_transcript_window(chunk, meeting_id)
+                        if event:
+                            if meeting_id not in decisions:
+                                decisions[meeting_id] = []
+                            decisions[meeting_id].append(event)
+                            print(f"[decision-listener] [{meeting_id}] {event.type}: {event.summary}")
+                            event_data = event.model_dump()
+                            for queue in subscribers.get(meeting_id, []):
+                                try:
+                                    queue.put_nowait(event_data)
+                                except asyncio.QueueFull:
+                                    pass
+                    analysis_count += 1
+                    # For completed meetings, stop after full analysis
+                    print(f"[decision-listener] Completed analysis for meeting {meeting_id}: {len(decisions.get(meeting_id, []))} items found")
+                    return
+                else:
+                    # Live meeting: analyze latest window
+                    event = await analyze_transcript_window(segment_buffer, meeting_id)
+                    if event:
+                        if meeting_id not in decisions:
+                            decisions[meeting_id] = []
+                        decisions[meeting_id].append(event)
+                        print(f"[decision-listener] [{meeting_id}] {event.type}: {event.summary}")
+                        event_data = event.model_dump()
+                        for queue in subscribers.get(meeting_id, []):
+                            try:
+                                queue.put_nowait(event_data)
+                            except asyncio.QueueFull:
+                                pass
+                    analysis_count += 1
 
             await asyncio.sleep(3)  # Poll every 3 seconds
         except asyncio.CancelledError:
