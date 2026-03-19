@@ -259,6 +259,9 @@ services:
       DEVICE_TYPE: remote
       WHISPER_LIVE_URL: ws://whisperlive:9090/ws
       ADMIN_TOKEN: vexa-local-admin-token
+      # [LOCAL-FORK] Vision snapshot configuration
+      OLLAMA_URL: http://host.docker.internal:11434
+      VISION_MODEL: ${VISION_MODEL:-qwen3-vl:8b}
       # Storage
       STORAGE_BACKEND: minio
       MINIO_ENDPOINT: minio:9000
@@ -385,13 +388,17 @@ services:
   # [LOCAL-FORK] The dashboard hardcodes Secure flag on cookies, which breaks
   # plain HTTP access from other machines. We put nginx in front to strip it.
   dashboard-internal:
-    image: vexaai/vexa-dashboard:latest
+    # [LOCAL-FORK] Build from source to enable custom features (avatar, vision snapshots)
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
     expose:
       - "3000"
     environment:
       VEXA_API_URL: http://api-gateway:8000
       VEXA_ADMIN_API_KEY: vexa-local-admin-token
       VEXA_ADMIN_API_URL: http://admin-api:8001
+      BOT_MANAGER_URL: http://bot-manager:8080
       JWT_SECRET: vexa-local-jwt-secret
       NEXT_PUBLIC_APP_URL: ${PUBLIC_HOST_URL:-http://localhost:3001}
       NEXT_PUBLIC_VEXA_WS_URL: ${PUBLIC_WS_URL:-ws://localhost:8056/ws}

@@ -2,6 +2,8 @@ import { Page } from "playwright";
 import { BotConfig } from "../../types";
 import { log, callStartupCallback } from "../../utils";
 import { hasStopSignalReceived, triggerPostAdmissionCamera, triggerPostAdmissionChat } from "../../index";
+// [LOCAL-FORK] Vision snapshot service
+import { VisionSnapshotService } from "../../services/vision-snapshot";
 
 export type AdmissionDecision = {
   admitted: boolean;
@@ -168,6 +170,19 @@ export async function runMeetingFlow(
     });
     const stopRemoval = strategies.startRemovalMonitor(page, () => { if (signalRemoval) signalRemoval(); });
 
+    // [LOCAL-FORK] Start vision snapshot service if enabled
+    let visionService: VisionSnapshotService | null = null;
+    if (botConfig.visionSnapshotsEnabled && page) {
+      try {
+        visionService = new VisionSnapshotService(page, botConfig);
+        await visionService.start();
+        log(`[Vision] Vision snapshot service started for meeting ${botConfig.meeting_id}`);
+      } catch (err: any) {
+        log(`[Vision] Failed to start vision snapshot service (non-fatal): ${err?.message || err}`);
+        visionService = null;
+      }
+    }
+
     try {
       await Promise.race([
         strategies.startRecording(page, botConfig),
@@ -202,6 +217,12 @@ export async function runMeetingFlow(
       await gracefulLeaveFunction(page, 1, "post_join_setup_error", errorDetails);
       return;
     } finally {
+      // [LOCAL-FORK] Stop vision snapshot service on meeting end
+      if (visionService) {
+        try { visionService.stop(); } catch (err: any) {
+          log(`[Vision] Error stopping vision service: ${err?.message || err}`);
+        }
+      }
       stopRemoval();
     }
   } catch (error: any) {

@@ -801,6 +801,16 @@ async def request_bot(
                         "Continuing without OBF token."
                     )
 
+        # [LOCAL-FORK] Fall back to user's stored avatar if not provided in request
+        avatar_url = req.default_avatar_url or (current_user.data or {}).get("default_avatar_url")
+        # [LOCAL-FORK] Auto-enable voice agent mode when custom avatar is set (required for virtual camera)
+        voice_agent_enabled = req.voice_agent_enabled or bool(avatar_url)
+
+        # [LOCAL-FORK] Read user recording config for vision settings
+        user_rec_cfg = {}
+        if current_user.data and isinstance(current_user.data, dict):
+            user_rec_cfg = current_user.data.get("recording_config", {})
+
         logger.info(f"Attempting to start bot container for meeting {meeting_id} (native: {native_meeting_id})...")
         container_id, connection_id = await start_bot_container(
             user_id=current_user.id,
@@ -816,8 +826,12 @@ async def request_bot(
             recording_enabled=req.recording_enabled,
             transcribe_enabled=req.transcribe_enabled,
             zoom_obf_token=zoom_obf_token_to_use,
-            voice_agent_enabled=req.voice_agent_enabled,
-            default_avatar_url=req.default_avatar_url
+            voice_agent_enabled=voice_agent_enabled,
+            default_avatar_url=avatar_url,
+            # [LOCAL-FORK] Vision snapshot kwargs
+            vision_snapshots_enabled=user_rec_cfg.get("vision_snapshots_enabled", False),
+            vision_snapshot_interval_ms=user_rec_cfg.get("vision_snapshot_interval_ms", 30000),
+            vision_model=user_rec_cfg.get("vision_model"),
         )
         container_start_time = datetime.utcnow()
         logger.info(f"Call to start_bot_container completed. Container ID: {container_id}, Connection ID: {connection_id}")
@@ -2287,6 +2301,10 @@ async def delete_recording(
 class RecordingConfigUpdate(BaseModel):
     enabled: Optional[bool] = Field(None, description="Enable or disable recording for this user's bots")
     capture_modes: Optional[List[str]] = Field(None, description="Capture modes: ['audio'], ['audio', 'video'], etc.")
+    # [LOCAL-FORK] Vision snapshot settings
+    vision_snapshots_enabled: Optional[bool] = Field(None, description="Enable vision snapshots during meetings")
+    vision_snapshot_interval_ms: Optional[int] = Field(None, ge=10000, le=120000, description="Interval between vision snapshots in ms")
+    vision_model: Optional[str] = Field(None, description="Vision model name for snapshot analysis")
 
 
 @app.get("/recording-config",
@@ -2305,6 +2323,10 @@ async def get_recording_config(
     return {
         "enabled": user_config.get("enabled", os.environ.get("RECORDING_ENABLED", "false").lower() == "true"),
         "capture_modes": user_config.get("capture_modes", os.environ.get("CAPTURE_MODES", "audio").split(",")),
+        # [LOCAL-FORK] Vision snapshot settings
+        "vision_snapshots_enabled": user_config.get("vision_snapshots_enabled", False),
+        "vision_snapshot_interval_ms": user_config.get("vision_snapshot_interval_ms", 30000),
+        "vision_model": user_config.get("vision_model", os.environ.get("VISION_MODEL", "qwen3-vl:8b")),
     }
 
 
@@ -2335,6 +2357,14 @@ async def update_recording_config(
                 raise HTTPException(status_code=400, detail=f"Invalid capture mode: {mode}. Valid: {sorted(valid_modes)}")
         recording_config["capture_modes"] = config.capture_modes
 
+    # [LOCAL-FORK] Vision snapshot settings
+    if config.vision_snapshots_enabled is not None:
+        recording_config["vision_snapshots_enabled"] = config.vision_snapshots_enabled
+    if config.vision_snapshot_interval_ms is not None:
+        recording_config["vision_snapshot_interval_ms"] = config.vision_snapshot_interval_ms
+    if config.vision_model is not None:
+        recording_config["vision_model"] = config.vision_model
+
     new_data["recording_config"] = recording_config
     user.data = new_data
 
@@ -2347,7 +2377,92 @@ async def update_recording_config(
     return {
         "enabled": recording_config.get("enabled", False),
         "capture_modes": recording_config.get("capture_modes", ["audio"]),
+        # [LOCAL-FORK] Vision snapshot settings
+        "vision_snapshots_enabled": recording_config.get("vision_snapshots_enabled", False),
+        "vision_snapshot_interval_ms": recording_config.get("vision_snapshot_interval_ms", 30000),
+        "vision_model": recording_config.get("vision_model", os.environ.get("VISION_MODEL", "qwen3-vl:8b")),
     }
+
+
+# --- [LOCAL-FORK] AVATAR ENDPOINTS ---
+
+MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2MB
+ALLOWED_AVATAR_TYPES = {"image/png": "png", "image/jpeg": "jpg"}
+
+
+@app.post("/user/avatar",
+          summary="Upload a bot avatar image",
+          tags=["User"])
+async def upload_user_avatar(
+    file: UploadFile = File(...),
+    auth: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a PNG or JPG avatar (max 2MB) to be used as the default bot avatar."""
+    token, user = auth
+
+    # Validate content type
+    if file.content_type not in ALLOWED_AVATAR_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {file.content_type}. Allowed: PNG, JPG",
+        )
+
+    # Read and validate size
+    data = await file.read()
+    if len(data) > MAX_AVATAR_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({len(data)} bytes). Maximum: {MAX_AVATAR_SIZE} bytes (2MB)",
+        )
+
+    ext = ALLOWED_AVATAR_TYPES[file.content_type]
+    storage_path = f"avatars/{user.id}/bot-avatar.{ext}"
+
+    storage = get_storage_client()
+    storage.upload_file(storage_path, data, content_type=file.content_type)
+    presigned_url = storage.get_presigned_url(storage_path, expires=3600 * 24 * 7)  # 7 days
+
+    # Persist URL in user.data
+    new_data = dict(user.data) if user.data else {}
+    new_data["default_avatar_url"] = presigned_url
+    user.data = new_data
+    attributes.flag_modified(user, "data")
+    await db.commit()
+    await db.refresh(user)
+
+    return {"avatar_url": presigned_url}
+
+
+@app.get("/user/avatar",
+         summary="Get the user's stored bot avatar URL",
+         tags=["User"])
+async def get_user_avatar(
+    auth: tuple = Depends(get_user_and_token),
+):
+    """Returns the user's default avatar URL, or null if none is set."""
+    token, user = auth
+    avatar_url = (user.data or {}).get("default_avatar_url")
+    return {"avatar_url": avatar_url}
+
+
+@app.delete("/user/avatar",
+            summary="Remove the user's stored bot avatar",
+            tags=["User"])
+async def delete_user_avatar(
+    auth: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the default avatar URL from the user's profile."""
+    token, user = auth
+
+    new_data = dict(user.data) if user.data else {}
+    new_data.pop("default_avatar_url", None)
+    user.data = new_data
+    attributes.flag_modified(user, "data")
+    await db.commit()
+
+    return {"success": True}
 
 
 # --- RECONCILIATION TASK: Detect and fix zombie meetings and orphan containers ---

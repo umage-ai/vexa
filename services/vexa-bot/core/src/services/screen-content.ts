@@ -41,11 +41,31 @@ export class ScreenContentService {
     this.page = page;
     // If a custom default avatar URL was provided via bot config, use it
     if (defaultAvatarUrl) {
-      this._customAvatarDataUri = defaultAvatarUrl;
-      log(`[ScreenContent] Custom default avatar URL set from config: ${defaultAvatarUrl.substring(0, 80)}...`);
+      // [LOCAL-FORK] If it's an HTTP(S) URL, fetch and convert to data URI asynchronously
+      if (defaultAvatarUrl.startsWith('http://') || defaultAvatarUrl.startsWith('https://')) {
+        log(`[ScreenContent] Custom avatar is HTTP URL, fetching: ${defaultAvatarUrl.substring(0, 80)}...`);
+        this._loadAvatarFromUrl(defaultAvatarUrl).then((dataUri) => {
+          this._customAvatarDataUri = dataUri;
+          log(`[ScreenContent] Custom avatar loaded from URL (${dataUri.length} chars)`);
+        }).catch((err: any) => {
+          log(`[ScreenContent] Failed to fetch avatar from URL: ${err.message}`);
+        });
+      } else {
+        this._customAvatarDataUri = defaultAvatarUrl;
+        log(`[ScreenContent] Custom default avatar URL set from config: ${defaultAvatarUrl.substring(0, 80)}...`);
+      }
     }
     // Load the built-in Vexa logo as fallback
     this._loadDefaultAvatar();
+  }
+
+  // [LOCAL-FORK] Fetch avatar from HTTP URL and convert to data URI
+  private async _loadAvatarFromUrl(url: string): Promise<string> {
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString('base64');
+    const contentType = response.headers.get('content-type') || 'image/png';
+    return `data:${contentType};base64,${base64}`;
   }
 
   private _loadDefaultAvatar(): void {
@@ -925,8 +945,12 @@ export class ScreenContentService {
           ctx.fillStyle = '#000000';
           ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-          // Draw the logo small and centered (~12% of canvas height)
-          const maxSize = Math.max(Math.round(canvas.height * 0.12), 100);
+          // [LOCAL-FORK] Draw avatar large and centered (~70% of canvas height for custom avatars)
+          // The original 12% was for a small logo watermark; custom avatars should fill the frame
+          const isDataUri = imgSrc.startsWith('data:image/svg');
+          const maxSize = isDataUri
+            ? Math.max(Math.round(canvas.height * 0.12), 100)   // SVG logo: keep small
+            : Math.max(Math.round(canvas.height * 0.70), 300);  // Custom avatar: fill frame
           const scale = Math.min(maxSize / img.width, maxSize / img.height);
           const w = img.width * scale;
           const h = img.height * scale;

@@ -154,7 +154,11 @@ async def start_bot_container(
     transcribe_enabled: Optional[bool] = None,
     zoom_obf_token: Optional[str] = None,
     voice_agent_enabled: Optional[bool] = None,
-    default_avatar_url: Optional[str] = None
+    default_avatar_url: Optional[str] = None,
+    # [LOCAL-FORK] Vision snapshot configuration
+    vision_snapshots_enabled: Optional[bool] = False,
+    vision_snapshot_interval_ms: Optional[int] = 30000,
+    vision_model: Optional[str] = None,
 ) -> Optional[tuple[str, str]]:
     """
     Starts a vexa-bot container via requests_unixsocket AFTER checking user limit.
@@ -243,6 +247,12 @@ async def start_bot_container(
         bot_config_data["voiceAgentEnabled"] = bool(voice_agent_enabled)
     if default_avatar_url:
         bot_config_data["defaultAvatarUrl"] = default_avatar_url
+    # [LOCAL-FORK] Vision snapshots configuration
+    if os.getenv("OLLAMA_URL"):
+        bot_config_data["visionSnapshotsEnabled"] = bool(vision_snapshots_enabled)
+        bot_config_data["visionSnapshotIntervalMs"] = vision_snapshot_interval_ms or 30000
+        bot_config_data["visionModelUrl"] = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
+        bot_config_data["visionModelName"] = vision_model or os.getenv("VISION_MODEL", "qwen3-vl:8b")
     # Remove keys with None values before serializing
     cleaned_config_data = {k: v for k, v in bot_config_data.items() if v is not None}
     bot_config_json = json.dumps(cleaned_config_data)
@@ -304,7 +314,8 @@ async def start_bot_container(
         "Labels": {"vexa.user_id": str(user_id)}, # *** ADDED Label ***
         "HostConfig": {
             "NetworkMode": DOCKER_NETWORK,
-            "AutoRemove": False,  # [LOCAL-FORK] Changed from True to False for debugging crashed bot containers
+            "AutoRemove": True,
+            "ExtraHosts": ["host.docker.internal:host-gateway"],  # [LOCAL-FORK] Allow bot containers to reach host services (e.g. Ollama)
         },
     }
 

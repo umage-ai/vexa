@@ -27,4 +27,10 @@ export type BotConfig = {
   // Voice agent / meeting interaction interface
   voiceAgentEnabled?: boolean;  // Enable TTS, chat, screen share capabilities
   defaultAvatarUrl?: string;   // Custom default avatar image URL for virtual camera
+
+  // [LOCAL-FORK] Vision snapshot configuration
+  visionSnapshotsEnabled?: boolean;
+  visionSnapshotIntervalMs?: number;  // default 30000 (30s)
+  visionModelUrl?: string;            // Ollama URL e.g. http://host.docker.internal:11434
+  visionModelName?: string;           // e.g. qwen3-vl:8b
 }
