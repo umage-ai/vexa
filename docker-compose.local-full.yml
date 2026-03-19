@@ -392,6 +392,10 @@ services:
     build:
       context: ../dashboard
       dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_ vars must be available at build time for Next.js to inline them
+        NEXT_PUBLIC_DECISION_LISTENER_URL: ${DECISION_LISTENER_URL:-http://localhost:8766}
+        NEXT_PUBLIC_TRACKER_ENABLED: "true"
     expose:
       - "3000"
     environment:
@@ -408,6 +412,9 @@ services:
       AI_BASE_URL: http://ollama-proxy:8765/v1
       AI_MODEL: ollama/qwen3.5:27b
       AI_API_KEY: ollama
+      # [LOCAL-FORK] Decision listener URL (NEXT_PUBLIC_ = client-side, needs host-reachable URL)
+      NEXT_PUBLIC_DECISION_LISTENER_URL: ${DECISION_LISTENER_URL:-http://localhost:8766}
+      NEXT_PUBLIC_TRACKER_ENABLED: "true"
     depends_on:
       api-gateway:
         condition: service_started
@@ -423,6 +430,31 @@ services:
       - ./dashboard-proxy.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       dashboard-internal:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # [LOCAL-FORK] Decision Listener — real-time meeting analysis with Ollama
+  # ---------------------------------------------------------------------------
+  decision-listener:
+    build:
+      context: ./services/decision-listener
+      dockerfile: Dockerfile
+    ports:
+      - "8766:8766"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_URL: http://host.docker.internal:11434
+      LLM_MODEL: ${LLM_MODEL:-qwen3.5:27b}
+      WINDOW_SIZE: "20"
+      ANALYSIS_INTERVAL: "15"
+      PORT: "8766"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
         condition: service_started
     networks:
       - vexa_default
