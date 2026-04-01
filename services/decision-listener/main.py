@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5:27b")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss:20b")
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "20"))  # transcript segments per analysis window
 ANALYSIS_INTERVAL = float(os.environ.get("ANALYSIS_INTERVAL", "15"))  # seconds between analyses
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
@@ -170,7 +170,8 @@ async def analyze_transcript_window(segments: list[dict], meeting_id: str) -> Op
     user_message = f"Analyze these recent transcript segments:\n\n{transcript_text}"
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            print(f"[decision-listener] Sending {len(segments)} segments to {LLM_MODEL} for analysis...")
             resp = await client.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
@@ -186,17 +187,20 @@ async def analyze_transcript_window(segments: list[dict], meeting_id: str) -> Op
             resp.raise_for_status()
             data = resp.json()
             content = data.get("message", {}).get("content", "")
+            print(f"[decision-listener] LLM response: {content[:200]}")
 
             # Parse the JSON response
             result = json.loads(content)
             item_type = result.get("type", "no_match")
 
             if item_type == "no_match":
+                print(f"[decision-listener] No match for this window")
                 return None
 
             # Validate type is a known category
             known_keys = {c.key for c in config.categories if c.enabled}
             if item_type not in known_keys:
+                print(f"[decision-listener] Unknown type '{item_type}', known: {known_keys}")
                 return None
 
             return DecisionEvent(
@@ -208,7 +212,7 @@ async def analyze_transcript_window(segments: list[dict], meeting_id: str) -> Op
                 timestamp=time.time(),
             )
     except Exception as e:
-        print(f"[decision-listener] LLM analysis error: {e}")
+        print(f"[decision-listener] LLM analysis error: {type(e).__name__}: {e}")
         return None
 
 # ---------------------------------------------------------------------------
@@ -428,11 +432,7 @@ async def stream_decisions(meeting_id: str, request: Request):
 
 @app.get("/decisions/{meeting_id}/all")
 async def get_all_decisions(meeting_id: str):
-    """Return all captured decisions for a meeting."""
-    # Start analysis loop if not running
-    if meeting_id not in analysis_tasks or analysis_tasks[meeting_id].done():
-        analysis_tasks[meeting_id] = asyncio.create_task(meeting_analysis_loop(meeting_id))
-
+    """Return all captured decisions for a meeting (does NOT start analysis)."""
     items = decisions.get(meeting_id, [])
     return [d.model_dump() if hasattr(d, "model_dump") else d for d in items]
 
